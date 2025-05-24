@@ -1,78 +1,119 @@
 # backend/app.py
-from flask import Flask, request, jsonify, send_file
-import os, uuid
-import inference  # our inference module
-from pytube import YouTube     # for downloading YouTube videos
 
-app = Flask(__name__)
+import os
+import uuid
+from flask import Flask, request, jsonify
+from pytube import YouTube
+import inference  # your inference module
 
-# (Optional) Endpoint to list available models for selection
+# Create the Flask app, telling it that "static/" is its static folder
+app = Flask(__name__, static_folder="static")
+
 @app.route("/models", methods=["GET"])
 def list_models():
-    models_dir = "backend/saved_models"
-    model_files = [f for f in os.listdir(models_dir) if f.endswith(".pth")]
-    # Return just base names without extension for clarity
+    """
+    List all available model names (base filenames of .pth files).
+    """
+    models_dir = os.path.join(os.path.dirname(__file__), "saved_models")
+    try:
+        model_files = [f for f in os.listdir(models_dir) if f.endswith(".pth")]
+    except FileNotFoundError:
+        return jsonify({"models": [], "error": "saved_models directory not found"}), 500
+
     model_names = [os.path.splitext(f)[0] for f in model_files]
     return jsonify({"models": model_names})
 
+
 @app.route("/predict", methods=["POST"])
 def predict():
-    # 1. Handle input: either an uploaded file or a YouTube URL
-    video_file = request.files.get("video")
-    youtube_url = request.form.get("youtube_url")
-    if not video_file and not youtube_url:
-        return jsonify({"error": "No video provided"}), 400
+    """
+    Accept either:
+      - A file upload under the form-field "file"
+      - A YouTube link under "url" or "youtube_url"
+    Plus:
+      - The selected model name under "model"
+      - A grad-cam flag under "gradcam" ("true"/"false")
 
-    # Save the video to a temporary file
-    temp_dir = "backend/static"  # ensure this exists and is writable
-    os.makedirs(temp_dir, exist_ok=True)
-    temp_path = os.path.join(temp_dir, f"input_{uuid.uuid4()}.mp4")
+    Runs inference and returns JSON with:
+      - class: predicted class label
+      - label: same as class (for compatibility)
+      - confidence: probability of the predicted class [0–1]
+      - probabilities: dict of all class probabilities
+      - video_url: URL to the annotated output video in /static/
+    """
+    # 1. Parse inputs
+    upload = request.files.get("file")
+    youtube_link = request.form.get("youtube_url") or request.form.get("url")
+    model_name = request.form.get("model")
+    gradcam_flag = request.form.get("gradcam", "false").lower() == "true"
+
+    if not upload and not youtube_link:
+        return jsonify({"error": "No video provided"}), 400
+    if not model_name:
+        return jsonify({"error": "No model specified"}), 400
+
+    # 2. Save/download the video into static/
+    static_dir = os.path.join(os.path.dirname(__file__), "static")
+    os.makedirs(static_dir, exist_ok=True)
+    temp_filename = f"input_{uuid.uuid4()}.mp4"
+    temp_path = os.path.join(static_dir, temp_filename)
+
     try:
-        if video_file:
-            video_file.save(temp_path)
+        if upload:
+            upload.save(temp_path)
         else:
-            # Download video from YouTube
-            yt = YouTube(youtube_url)
+            yt = YouTube(youtube_link)
             stream = yt.streams.get_highest_resolution()
-            stream.download(output_path=os.path.dirname(temp_path), filename=os.path.basename(temp_path))
+            stream.download(output_path=static_dir, filename=temp_filename)
     except Exception as e:
         return jsonify({"error": f"Video retrieval failed: {e}"}), 500
 
-    # 2. Get the selected model name from the request
-    model_name = request.form.get("model")
-    if model_name is None:
-        # If not provided explicitly, try to infer from file name or use a default
-        return jsonify({"error": "No model specified"}), 400
-
-    # 3. Run inference (this will load the model, preprocess video, get prediction)
+    # 3. Run inference
     try:
-        result = inference.run_inference(temp_path, model_name)
+        result = inference.run_inference(
+            video_path=temp_path,
+            model_name=model_name,
+            gradcam=gradcam_flag
+        )
     except Exception as e:
-        # Cleanup and error handling
-        os.remove(temp_path)
+        # Clean up the temp file on error
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
         return jsonify({"error": f"Inference failed: {e}"}), 500
 
-    # 4. Remove the temp video file after processing
-    os.remove(temp_path)
+    # Remove the raw input video
+    if os.path.exists(temp_path):
+        os.remove(temp_path)
 
-    # The result contains label, confidence, and path to annotated video
-    label = result["label"]
-    confidence = result["confidence"]
-    ann_video_path = result.get("annotated_video")  # path to annotated video if created
-
-    # 5. Return results. We can send the video file or provide a URL reference.
-    response_data = {
-        "label": label,
-        "confidence": confidence
+    # 4. Build response
+    label = result.get("label")
+    confidence = result.get("confidence")
+    # Build class-probabilities dict
+    # (Assumes binary classification: ["ASD Negative", "ASD Positive"])
+    prob_pos = float(confidence or 0.0)
+    prob_neg = 1.0 - prob_pos
+    probabilities = {
+        "ASD Negative": prob_neg,
+        "ASD Positive": prob_pos
     }
-    if ann_video_path:
-        # Option 1: Return a direct URL to the video (assuming static folder is exposed)
-        response_data["video_url"] = request.host_url + "static/" + os.path.basename(ann_video_path)
-        # Option 2: Send the video file directly (commented out):
-        # return send_file(ann_video_path, mimetype="video/mp4")
-    return jsonify(response_data)
+
+    response = {
+        "class": label,
+        "label": label,
+        "confidence": prob_pos if label == "ASD Positive" else prob_neg,
+        "probabilities": probabilities
+    }
+
+    # If an annotated video was produced, expose its URL
+    ann_path = result.get("annotated_video")
+    if ann_path:
+        ann_fname = os.path.basename(ann_path)
+        # Flask serves static/ at /static/
+        response["video_url"] = request.host_url.rstrip("/") + f"/static/{ann_fname}"
+
+    return jsonify(response)
+
 
 if __name__ == "__main__":
+    # Run the app on port 5000
     app.run(host="0.0.0.0", port=5000)
-# Note: Ensure that the backend/saved_models directory exists and contains the model files.     
-# Also, ensure that the backend/static directory exists and is writable for saving temporary files.
